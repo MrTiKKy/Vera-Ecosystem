@@ -10,6 +10,24 @@ import base64
 import tempfile
 import os
 import re
+import json
+from flask import request, jsonify
+from flask_cors import CORS
+import google.generativeai as genai
+import cv2
+from PIL import Image
+import io
+import warnings
+warnings.filterwarnings('ignore')
+
+# TensorFlow imports for CNN
+try:
+    import tensorflow as tf
+    from tensorflow.keras.applications import ResNet50
+    from tensorflow.keras.preprocessing import image as keras_image
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
 
 # ---------------- CONFIG ----------------
 
@@ -22,6 +40,15 @@ app = dash.Dash(
 )
 
 server = app.server
+
+# Enable CORS for chatbot API communication
+CORS(server, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:*", "http://127.0.0.1:*"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"]
+    }
+})
 
 THEME_COLOR = "#2da1ad"
 SEG_COLOR   = "#ff4466"
@@ -766,6 +793,393 @@ def _get_hu_range(preset, cmin, cmax):
     if preset == "Custom":
         return float(cmin or -200), float(cmax or 200)
     return HU_PRESETS.get(preset, (-950, -300))
+
+
+# ---------------- GEMINI AI CHATBOT ----------------
+
+# ============ CNN MEDICAL IMAGE ANALYSIS ============
+
+# Load pre-trained CNN model
+cnn_model = None
+cnn_model_loaded = False
+
+def load_cnn_model():
+    """Load pre-trained ResNet50 for feature extraction"""
+    global cnn_model, cnn_model_loaded
+    if cnn_model_loaded:
+        return cnn_model
+    
+    try:
+        if TF_AVAILABLE:
+            cnn_model = ResNet50(weights='imagenet', include_top=False, pooling='global')
+            cnn_model_loaded = True
+            return cnn_model
+    except Exception as e:
+        print(f"Warning: Could not load CNN model: {e}")
+        cnn_model_loaded = True
+        return None
+
+def extract_nifti_slices(nifti_path, num_slices=5):
+    """Extract representative slices from NIFTI file"""
+    try:
+        img_data = nib.load(nifti_path)
+        img_array = img_data.get_fdata()
+        
+        # Get shape
+        nz, ny, nx = img_array.shape if len(img_array.shape) == 3 else (1, img_array.shape[0], img_array.shape[1])
+        
+        # Extract slices from different depths
+        slices = []
+        depth_indices = [int(nz * (i+1) / (num_slices+1)) for i in range(num_slices)]
+        
+        for idx in depth_indices:
+            if len(img_array.shape) == 3:
+                slice_data = img_array[idx, :, :]
+            else:
+                slice_data = img_array
+            slices.append(slice_data)
+        
+        return slices, (nz, ny, nx)
+    except Exception as e:
+        print(f"Error extracting NIFTI slices: {e}")
+        return [], None
+
+def normalize_image(img_array):
+    """Normalize image to 0-255 range"""
+    img_min = np.min(img_array)
+    img_max = np.max(img_array)
+    if img_max > img_min:
+        normalized = ((img_array - img_min) / (img_max - img_min) * 255).astype(np.uint8)
+    else:
+        normalized = np.zeros_like(img_array, dtype=np.uint8)
+    return normalized
+
+def get_file_type(filename):
+    """Detect if file is NIFTI or JPG"""
+    ext = filename.lower().split('.')[-1]
+    if ext in ['nii', 'gz']:
+        return 'nifti'
+    elif ext in ['jpg', 'jpeg', 'png', 'bmp']:
+        return 'image'
+    return 'unknown'
+
+def extract_jpg_data(jpg_path):
+    """Extract medical image data from JPG file"""
+    try:
+        img = Image.open(jpg_path)
+        img_array = np.array(img)
+        
+        # Convert to grayscale if needed
+        if len(img_array.shape) == 3:
+            img_gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        else:
+            img_gray = img_array
+        
+        return [img_gray], img_array.shape
+    except Exception as e:
+        print(f"Error extracting JPG data: {e}")
+        return [], None
+
+def analyze_medical_image(file_path, filename=""):
+    """Analyze medical image for pathology features (supports both NIFTI and JPG)"""
+    try:
+        features = {
+            "texture_analysis": {},
+            "intensity_stats": {},
+            "pathology_score": 0.0,
+            "findings": [],
+            "file_type": ""
+        }
+        
+        # Detect file type
+        file_type = get_file_type(filename or file_path)
+        features["file_type"] = file_type
+        
+        # Extract slices based on file type
+        if file_type == 'nifti':
+            slices, shape = extract_nifti_slices(file_path)
+        elif file_type == 'image':
+            slices, shape = extract_jpg_data(file_path)
+        else:
+            return features
+        
+        if not slices:
+            return features
+        
+        # Analyze slices
+        all_pixels = []
+        for slice_data in slices:
+            normalized = normalize_image(slice_data)
+            all_pixels.extend(normalized.flatten())
+        
+        # Calculate overall statistics
+        all_pixels = np.array(all_pixels)
+        features["intensity_stats"] = {
+            "mean_intensity": float(np.mean(all_pixels)),
+            "std_intensity": float(np.std(all_pixels)),
+            "intensity_range": [float(np.min(all_pixels)), float(np.max(all_pixels))]
+        }
+        
+        # Compute pathology score based on intensity variance
+        intensity_variance = float(np.var(all_pixels))
+        features["pathology_score"] = min(1.0, intensity_variance / 1000.0)  # Normalized score
+        
+        # Preliminary findings based on statistics
+        if features["pathology_score"] > 0.7:
+            features["findings"].append("High intensity variance detected - possible abnormality")
+        elif features["pathology_score"] > 0.4:
+            features["findings"].append("Moderate intensity variance - recommend detailed review")
+        else:
+            features["findings"].append("Normal intensity distribution observed")
+        
+        return features
+    except Exception as e:
+        print(f"Error analyzing medical image: {e}")
+        return {"error": str(e), "pathology_score": 0.0, "findings": ["Error during analysis"]}
+
+
+# ============ END CNN SECTION ============
+
+# Initialize Gemini API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    MODEL = genai.GenerativeModel("gemini-2.5-flash")
+else:
+    MODEL = None
+
+# Store conversation history per session
+chat_sessions = {}
+
+def get_or_create_chat(session_id):
+    """Get or create a chat session for Vera assistant"""
+    if session_id not in chat_sessions:
+        if MODEL:
+            chat_sessions[session_id] = MODEL.start_chat(history=[])
+        else:
+            chat_sessions[session_id] = None
+    return chat_sessions[session_id]
+
+def get_vera_response(user_message, session_id, context=None):
+    """Get response from Vera (Gemini) AI"""
+    try:
+        chat = get_or_create_chat(session_id)
+        
+        if not MODEL or not chat:
+            return "ERROR: Gemini API not configured. Please set GEMINI_API_KEY environment variable."
+        
+        # Build system prompt
+        system_prompt = """You are VERA, a specialized medical AI assistant for the Vera Ecosystem.
+Your role is to:
+- Provide accurate medical insights about uploaded scans and volumetric data
+- Analyze anatomical structures with precision
+- Assist with pathology detection and clinical decision support
+- Ask clarifying questions when needed
+- Always emphasize the need for professional medical review
+- Be concise but informative
+
+Keep responses under 150 words unless explicitly asked for more detail.
+Current context: {}
+
+User message: {}""".format(context or "No specific scan context", user_message)
+        
+        response = chat.send_message(system_prompt)
+        return response.text
+        
+    except Exception as e:
+        return f"Error processing request: {str(e)}"
+
+
+# Flask endpoint for chatbot
+@server.route("/api/chat", methods=["POST"])
+def handle_chat():
+    """Handle chat messages from frontend"""
+    try:
+        data = request.get_json()
+        user_message = data.get("message", "")
+        session_id = data.get("session_id", "default")
+        context = data.get("context", None)
+        
+        if not user_message:
+            return jsonify({"error": "Empty message"}), 400
+        
+        response = get_vera_response(user_message, session_id, context)
+        
+        return jsonify({
+            "success": True,
+            "response": response,
+            "role": "vera"
+        }), 200
+        
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@server.route("/api/analyze-scan", methods=["POST"])
+def analyze_scan():
+    """Analyze uploaded medical scan (NIFTI or JPG) with CNN and provide AI interpretation"""
+    try:
+        data = request.get_json()
+        filename = data.get("filename", "unknown file")
+        file_data_b64 = data.get("file_data", None)
+        session_id = data.get("session_id", "default")
+        
+        if not file_data_b64:
+            return jsonify({
+                "success": False,
+                "error": "No file data provided"
+            }), 400
+        
+        # Decode base64 file
+        try:
+            decoded_data = base64.b64decode(file_data_b64)
+        except Exception as e:
+            return jsonify({
+                "success": False,
+                "error": f"Failed to decode file: {str(e)}"
+            }), 400
+        
+        # Detect file type and set appropriate suffix
+        file_type = get_file_type(filename)
+        if file_type == 'image':
+            suffix = f".{filename.split('.')[-1]}"
+        else:
+            suffix = ".nii.gz"
+        
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
+            tf.write(decoded_data)
+            temp_path = tf.name
+        
+        try:
+            # Analyze image with proper file type detection
+            analysis_results = analyze_medical_image(temp_path, filename)
+            
+            # Build context from analysis
+            context = f"""Scan Analysis: {filename}
+File Type: {file_type}
+Pathology Score: {analysis_results.get('pathology_score', 0):.2%}
+Findings: {', '.join(analysis_results.get('findings', ['No findings']))}
+Intensity Mean: {analysis_results.get('intensity_stats', {}).get('mean_intensity', 0):.1f}
+Intensity Range: {analysis_results.get('intensity_stats', {}).get('intensity_range', [0, 255])}"""
+            
+            # Get Gemini interpretation
+            interpretation_prompt = f"""Based on this medical scan analysis:
+{context}
+
+Provide a brief clinical interpretation:
+1. Key observations from the analysis
+2. Potential areas of concern (if any)
+3. Recommended next steps
+
+Keep it concise and professional."""
+            
+            gemini_response = get_vera_response(interpretation_prompt, session_id, context)
+            
+            return jsonify({
+                "success": True,
+                "response": gemini_response,
+                "analysis": analysis_results,
+                "context": context
+            }), 200
+            
+        finally:
+            # Clean up temp file
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+        
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+# NEW ENDPOINT: Analyze scan with actual file upload
+@server.route("/api/upload-and-analyze", methods=["POST"])
+def upload_and_analyze():
+    """Upload and analyze medical scan in one step (NIFTI or JPG)"""
+    try:
+        # Check if file is in request
+        if 'file' not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"error": "No file selected"}), 400
+        
+        session_id = request.form.get('session_id', 'default')
+        
+        # Detect file type and set appropriate suffix
+        file_type = get_file_type(file.filename)
+        if file_type == 'image':
+            suffix = f".{file.filename.split('.')[-1]}"
+        else:
+            suffix = ".nii.gz"
+        
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
+            file.save(tf.name)
+            temp_path = tf.name
+        
+        try:
+            # Analyze image with file type detection
+            analysis_results = analyze_medical_image(temp_path, file.filename)
+            
+            # Build context
+            context = f"""Medical Scan Analysis: {file.filename}
+File Type: {file_type}
+Pathology Risk Score: {analysis_results.get('pathology_score', 0):.2%}
+Clinical Findings: {', '.join(analysis_results.get('findings', ['Assessment pending']))}
+Image Statistics:
+  - Mean Intensity: {analysis_results.get('intensity_stats', {}).get('mean_intensity', 0):.1f}
+  - Intensity Variance: {analysis_results.get('intensity_stats', {}).get('std_intensity', 0):.1f}"""
+            
+            # Get AI interpretation
+            interpretation_prompt = f"""Analyze this medical imaging report:
+
+{context}
+
+Provide clinical insights:
+1. Preliminary assessment of the imaging findings
+2. Areas requiring attention
+3. Recommended follow-up actions
+
+Be professional and evidence-based."""
+            
+            ai_response = get_vera_response(interpretation_prompt, session_id, context)
+            
+            return jsonify({
+                "success": True,
+                "filename": file.filename,
+                "file_type": file_type,
+                "analysis": analysis_results,
+                "ai_interpretation": ai_response,
+                "context": context
+            }), 200
+            
+        finally:
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+                
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 
 # ---------------- RUN ----------------

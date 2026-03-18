@@ -6,3 +6,11 @@ numpy
 nibabel
 scikit-image
 scipy
+google-generativeai
+python-dotenv
+flask-cors
+tensorflow-cpu
+opencv-python
+Pillow
+scikit-learn
+requests

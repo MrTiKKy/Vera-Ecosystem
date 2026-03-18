@@ -12,6 +12,12 @@ const Atlas3D = () => {
   // Stări pentru AI Detection integrate direct
   const [dragActive, setDragActive] = useState(false);
   const [chatHistory, setChatHistory] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [sessionId] = useState(() => `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`);
+  const [scanContext, setScanContext] = useState(null);
+  const chatEndRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   const systems = [
     { id: 'teeth', label: 'Mouth and Teeth', code: 'SYS-01', 
@@ -48,6 +54,111 @@ const Atlas3D = () => {
     },
   ];
 
+  // ===== CHATBOT INTEGRATION =====
+  
+  // Send message to backend AI
+  const sendChatMessage = async (message) => {
+    if (!message.trim()) return;
+
+    setIsLoading(true);
+    setChatInput('');
+    
+    // Add user message to history
+    setChatHistory(prev => [...prev, { role: 'user', text: message }]);
+
+    try {
+      const response = await fetch('http://localhost:8050/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: message,
+          session_id: sessionId,
+          context: scanContext
+        })
+      });
+
+      const data = await response.json();
+      
+      if (data.success) {
+        setChatHistory(prev => [...prev, { role: 'vera', text: data.response }]);
+      } else {
+        setChatHistory(prev => [...prev, { role: 'vera', text: `ERROR: ${data.error}` }]);
+      }
+    } catch (error) {
+      setChatHistory(prev => [...prev, { role: 'vera', text: `Connection error: ${error.message}` }]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Analyze uploaded scan
+  const analyzeScan = async (file) => {
+    if (!file) return;
+    
+    setIsLoading(true);
+    setChatHistory(prev => [...prev, { role: 'user', text: `FILE_UPLOAD: ${file.name}` }]);
+    
+    try {
+      // Read file as base64
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        try {
+          const base64Data = e.target.result.split(',')[1]; // Remove data:application/octet-stream; prefix
+          
+          const response = await fetch('http://localhost:8050/api/analyze-scan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              filename: file.name,
+              file_data: base64Data,
+              session_id: sessionId
+            })
+          });
+
+          const data = await response.json();
+          
+          if (data.success) {
+            setScanContext(data.context);
+            setChatHistory(prev => [...prev, { 
+              role: 'vera', 
+              text: `AI Analysis:\n\n${data.response}\n\nPathology Score: ${(data.analysis?.pathology_score || 0).toFixed(2)}` 
+            }]);
+          } else {
+            setChatHistory(prev => [...prev, { role: 'vera', text: `Error: ${data.error}` }]);
+          }
+        } catch (error) {
+          setChatHistory(prev => [...prev, { role: 'vera', text: `Connection error: ${error.message}` }]);
+        } finally {
+          setIsLoading(false);
+        }
+      };
+      
+      reader.onerror = () => {
+        setChatHistory(prev => [...prev, { role: 'vera', text: 'Error reading file' }]);
+        setIsLoading(false);
+      };
+      
+      reader.readAsDataURL(file);
+      
+    } catch (error) {
+      setChatHistory(prev => [...prev, { role: 'vera', text: `Error: ${error.message}` }]);
+      setIsLoading(false);
+    }
+  };
+
+  // Handle chat input key press
+  const handleChatKeyPress = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !isLoading) {
+      e.preventDefault();
+      sendChatMessage(chatInput);
+    }
+  };
+
+  // Scroll chat to bottom
+  React.useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatHistory]);
+
 
   const handleSystemSelect = (system) => {
     setSelectedSystem(system);
@@ -69,13 +180,23 @@ const Atlas3D = () => {
     setDragActive(false);
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       const file = e.dataTransfer.files[0];
-      setChatHistory(prev => [...prev, { role: 'user', text: `FILE_UPLOAD: ${file.name}` }]);
-      
-      // Simulare procesare AI (Aici vom lega API-ul Python ulterior)
-      setTimeout(() => {
-        setChatHistory(prev => [...prev, { role: 'vera', text: "ANALYSING VOLUMETRIC DATA... RUNNING PATHOLOGY DETECTION..." }]);
-      }, 800);
+      analyzeScan(file);
     }
+  };
+
+  // Handle file input selection
+  const handleFileSelect = (e) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      analyzeScan(file);
+      // Reset input for re-selection of same file
+      e.target.value = '';
+    }
+  };
+
+  // Trigger file picker
+  const openFilePicket = () => {
+    fileInputRef.current?.click();
   };
 
   return (
@@ -190,17 +311,25 @@ const Atlas3D = () => {
                 {/* Zona de Drop */}
                 <div className="flex-1 flex flex-col gap-4">
                     <p className="text-[#2da1ad] text-[10px] font-black tracking-widest uppercase italic">Pathology Input</p>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      onChange={handleFileSelect}
+                      accept=".nii,.nii.gz,.jpg,.jpeg,.png,.bmp,.dicom,.dcm"
+                      style={{ display: 'none' }}
+                    />
                     <div 
+                      onClick={openFilePicket}
                       onDragEnter={handleDrag} onDragLeave={handleDrag} onDragOver={handleDrag} onDrop={handleDrop}
-                      className={`flex-1 border-2 border-dashed rounded-[2.5rem] transition-all flex flex-col items-center justify-center p-10 text-center ${
-                        dragActive ? 'border-[#2da1ad] bg-[#2da1ad]/5' : 'border-white/5 bg-white/[0.02]'
+                      className={`flex-1 border-2 border-dashed rounded-[2.5rem] transition-all flex flex-col items-center justify-center p-10 text-center cursor-pointer ${
+                        dragActive ? 'border-[#2da1ad] bg-[#2da1ad]/5' : 'border-white/5 bg-white/[0.02] hover:border-white/20'
                       }`}
                     >
                       <div className="w-12 h-12 mb-4 rounded-xl bg-white/5 flex items-center justify-center border border-white/10 rotate-45">
                         <span className="text-[#2da1ad] text-xl -rotate-45">+</span>
                       </div>
                       <p className="text-white/60 font-bold tracking-tight text-sm uppercase italic">Drop Medical Scan</p>
-                      <p className="text-white/20 text-[8px] mt-2 uppercase tracking-[0.2em] font-mono">DICOM / NIFTI / SCAN</p>
+                      <p className="text-white/20 text-[8px] mt-2 uppercase tracking-[0.2em] font-mono">NIFTI / JPG / PNG / DICOM</p>
                     </div>
                 </div>
 
@@ -217,11 +346,16 @@ const Atlas3D = () => {
                            {msg.text}
                         </div>
                       ))}
+                      <div ref={chatEndRef} />
                    </div>
                    <div className="p-4 bg-white/[0.02]">
                       <input 
-                        className="w-full bg-transparent border border-white/10 rounded-full px-5 py-3 text-white text-[10px] focus:outline-none focus:border-[#2da1ad]/50"
+                        className="w-full bg-transparent border border-white/10 rounded-full px-5 py-3 text-white text-[10px] focus:outline-none focus:border-[#2da1ad]/50 disabled:opacity-50"
                         placeholder="Type command or query..."
+                        value={chatInput}
+                        onChange={(e) => setChatInput(e.target.value)}
+                        onKeyPress={handleChatKeyPress}
+                        disabled={isLoading}
                       />
                    </div>
                 </div>
